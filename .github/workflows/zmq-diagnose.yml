@@ -1,0 +1,144 @@
+name: zmq-sigsegv-diagnose (issue 571)
+
+# Root-cause dig for vllm-project/router#571: capture the actual fault on
+# ubuntu-26.04 (gdb backtrace, ASan report) and isolate compiler vs libc
+# (26.04 + g++-13). Artifacts are uploaded for local disassembly.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro/issue-571-zmq]
+
+concurrency:
+  group: zmq-diag-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gdb-backtrace:
+    name: gdb backtrace on ubuntu-26.04
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "full"
+      CC_ENABLE_DEBUG_OUTPUT: "1"
+      CFLAGS: "-g -O0 -fno-omit-frame-pointer"
+      CXXFLAGS: "-g -O0 -fno-omit-frame-pointer"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler gdb
+      - name: Build test binary
+        run: |
+          cargo test --features cpu,ready --lib --no-run > build.log 2>&1 || (tail -50 build.log; exit 1)
+          # Show the exact cc invocations used for libzmq (first few)
+          grep -m6 "ctx.cpp\|socket_base.cpp\|zmq.cpp" build.log || true
+          g++ --version | head -1
+      - name: Locate test binary
+        id: bin
+        run: |
+          BIN=$(find target/debug/deps -maxdepth 1 -type f -name 'vllm_router_rs-*' -perm -111 -newer Cargo.toml | head -1)
+          [ -n "$BIN" ] || BIN=$(ls -t target/debug/deps/vllm_router_rs-* | grep -v '\.d$' | head -1)
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+          echo "testing $BIN"
+      - name: Raw run (confirm crash outside cargo)
+        run: |
+          ${{ steps.bin.outputs.bin }} --test-threads=1 abandoned_pushes_cancel_all_consumer_shards; echo "raw exit=$?"
+      - name: gdb
+        run: |
+          gdb -q -batch \
+            -ex "set pagination off" \
+            -ex "set print pretty on" \
+            -ex run \
+            -ex "echo \n=====BACKTRACE=====\n" \
+            -ex "bt 40" \
+            -ex "echo \n=====BT-FULL-top=====\n" \
+            -ex "bt full 8" \
+            -ex "echo \n=====REGISTERS=====\n" \
+            -ex "info registers" \
+            -ex "echo \n=====CODE-AT-PC=====\n" \
+            -ex "x/16i \$pc-24" \
+            -ex "echo \n=====ALL-THREADS=====\n" \
+            -ex "thread apply all bt 12" \
+            -ex "echo \n=====LOCALS-source=====\n" \
+            -ex "info line" \
+            --args ${{ steps.bin.outputs.bin }} --test-threads=1 abandoned_pushes_cancel_all_consumer_shards 2>&1 | tee gdb.log
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-gdb-2604
+          path: |
+            gdb.log
+            build.log
+          if-no-files-found: warn
+      - name: Upload static libzmq + test binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-binaries-2604
+          path: |
+            target/debug/build/zmq-sys-*/out/lib/*.a
+          if-no-files-found: warn
+
+  asan:
+    name: ASan on ubuntu-26.04 (libzmq instrumented)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: "0"
+      CFLAGS: "-fsanitize=address -g -O0 -fno-omit-frame-pointer"
+      CXXFLAGS: "-fsanitize=address -g -O0 -fno-omit-frame-pointer"
+      RUSTFLAGS: "-Clink-arg=-fsanitize=address"
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:print_legend=0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler
+      - name: Build test binary
+        run: cargo test --features cpu,ready --lib --no-run > build.log 2>&1 || (tail -50 build.log; exit 1)
+      - name: Run one zmq test under ASan
+        run: |
+          BIN=$(find target/debug/deps -maxdepth 1 -type f -name 'vllm_router_rs-*' -perm -111 -newer Cargo.toml | head -1)
+          [ -n "$BIN" ] || BIN=$(ls -t target/debug/deps/vllm_router_rs-* | grep -v '\.d$' | head -1)
+          $BIN --test-threads=1 abandoned_pushes_cancel_all_consumer_shards 2>&1 | tee asan.log || echo "exit=$? (captured)"
+      - name: Upload ASan log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-asan-2604
+          path: |
+            asan.log
+            build.log
+          if-no-files-found: warn
+
+  gcc13-isolation:
+    name: ubuntu-26.04 + g++-13 (compiler vs libc)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: "0"
+      CXX: "g++-13"
+      CC: "gcc-13"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler g++-13
+          g++-13 --version | head -1
+      - name: Run the 3 zmq tests
+        run: |
+          cargo test --features cpu,ready --lib -- --test-threads=1 \
+            configured_event_sources_skip_unavailable_control_discovery \
+            discovered_source_bindings_are_atomic_and_released_with_the_worker \
+            abandoned_pushes_cancel_all_consumer_shards
