@@ -1,0 +1,79 @@
+name: zmq-sigsegv-repro (issue 571)
+
+# Investigation for vllm-project/router#571: SIGSEGV in zmq-backed tests on
+# GitHub-hosted ubuntu images. Discriminates between host images and the
+# rust:1.95.0-bookworm container (Buildkite CPU lane parity).
+# Runs the exact 3 tests named in the issue, then the full unit lane.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro/issue-571-zmq]
+
+concurrency:
+  group: zmq-repro-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04-native
+            os: ubuntu-22.04
+          - name: ubuntu-24.04-native
+            os: ubuntu-24.04
+          - name: ubuntu-26.04-native
+            os: ubuntu-26.04
+          - name: ubuntu-latest-native
+            os: ubuntu-latest
+          - name: ubuntu-latest-bookworm-container
+            os: ubuntu-latest
+            container: "rust:1.95.0-bookworm"
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "full"
+      CARGO_TERM_COLOR: "never"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+          for attempt in 1 2 3; do
+            $SUDO apt-get update -o Acquire::Retries=5 &&
+              $SUDO apt-get install -y --no-install-recommends \
+                pkg-config libssl-dev protobuf-compiler && break
+            echo "apt attempt ${attempt} failed; retrying" >&2
+            sleep 10
+          done
+      - name: Record environment
+        run: |
+          head -2 /etc/os-release
+          gcc --version | head -1
+          g++ --version | head -1
+          ldd --version | head -1
+          rustc --version
+          cargo --version
+      - name: Issue 571 repro - 3 named zmq tests
+        run: |
+          cargo test --features cpu,ready --lib -- --test-threads=1 --nocapture \
+            configured_event_sources_skip_unavailable_control_discovery \
+            discovered_source_bindings_are_atomic_and_released_with_the_worker \
+            abandoned_pushes_cancel_all_consumer_shards
+      - name: Full unit lane (proposed tests.yml command)
+        run: |
+          cargo test --features cpu,ready --lib --bins -- --test-threads=1
+      - name: Smoke - non-zmq tests still pass (utils::json)
+        if: always()
+        run: |
+          cargo test --features cpu,ready --lib -- --test-threads=1 utils::json
