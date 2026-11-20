@@ -23,8 +23,8 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
-      CFLAGS: "-DHAVE_POSIX_MEMALIGN=1"
-      CXXFLAGS: "-DHAVE_POSIX_MEMALIGN=1"
+      CFLAGS: "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"
+      CXXFLAGS: "-DHAVE_POSIX_MEMALIGN=1 -DZMQ_CACHELINE_SIZE=64"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.95.0
