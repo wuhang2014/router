@@ -1,0 +1,90 @@
+name: zmq-sigsegv-forensics (issue 571)
+
+# Final forensics: exact cc flags for libzmq, DWARF type alignment of
+# zmq::command_t in the crashing binary, disasm of the faulting function,
+# and a same-flags contrast repro.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro/issue-571-zmq]
+
+concurrency:
+  group: zmq-forensics-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  forensics:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CC_ENABLE_DEBUG_OUTPUT: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install deps
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler gdb binutils
+      - name: Rebuild zmq-sys verbosely (capture cc commands)
+        run: |
+          cargo clean -p zmq-sys 2>/dev/null || true
+          cargo test --features cpu,ready --lib --no-run -vv > build-vv.log 2>&1 || (tail -40 build-vv.log; exit 1)
+          echo "--- libzmq compile commands:"
+          grep -m2 "vendor/src/ctx.cpp" build-vv.log | head -2
+          grep -m1 "vendor/src/ypipe\|vendor/src/mailbox.cpp" build-vv.log | head -1
+      - name: Locate test binary
+        id: bin
+        run: |
+          BIN=$(find target/debug/deps -maxdepth 1 -type f -name 'vllm_router_rs-*' -perm -111 | head -1)
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+      - name: DWARF type facts
+        run: |
+          gdb -q -batch \
+            -ex "p sizeof(zmq::command_t)" \
+            -ex "p alignof(zmq::command_t)" \
+            -ex "ptype /o zmq::command_t" \
+            ${{ steps.bin.outputs.bin }} 2>&1 | head -40 || true
+      - name: Disasm faulting function
+        run: |
+          objdump -d --no-show-raw-insn ${{ steps.bin.outputs.bin }} \
+            | awk '/<_ZN3zmq7ypipe_tINS_9command_tELi16EE5writeERKS1_b>:/{f=1} f{print} f&&/ret/{exit}' | head -45
+      - name: Same-flags contrast repro
+        run: |
+          # Extract the flag list from the captured ctx.cpp compile line
+          CCLINE=$(grep -m1 "vendor/src/ctx.cpp" build-vv.log || true)
+          echo "cc line: ${CCLINE:0:400}"
+          FLAGS=$(echo "$CCLINE" | grep -oE '\-(O[0-3s]|std=[a-z+0-9]+|fPIC|fno-PIE|fpic|m[a-z0-9=_-]+)' | sort -u | tr '\n' ' ')
+          echo "extracted flags: $FLAGS"
+          cat > r.cpp <<'EOF'
+          #include <cstdio>
+          #include <new>
+          struct command_t { void *destination; int type; union args_t { void *p; unsigned long u; } args; char pad[64 - 24]; };
+          struct chunk_t { command_t values[16]; chunk_t *prev; chunk_t *next; };
+          __attribute__((noinline)) void write_back (chunk_t *c_, unsigned pos_, const command_t &v_)
+          { c_->values[pos_] = v_; }
+          int main () {
+              printf ("sizeof=%zu alignof=%zu\n", sizeof (command_t), alignof (command_t));
+              command_t v {}; v.type = 3;
+              for (int round = 0; round < 64; round++) {
+                  chunk_t *c = new (std::nothrow) chunk_t;
+                  if (!c) break;
+                  write_back (c, (unsigned) (round % 16), v);
+              }
+              puts ("done-no-fault"); return 0;
+          }
+          EOF
+          g++ $FLAGS -g r.cpp -o r
+          echo "--- repro write_back vector moves:"
+          objdump -d --no-show-raw-insn r | awk '/_Z11write_back.*>:/{f=1} f{print} f&&/ret/{exit}' | grep -E "vmov|movdq|movaps|rep movs" | head -8 || echo "(scalar)"
+          ./r; ec=$?; echo "repro exit=$ec"; [ $ec -ne 139 ] || echo "=== repro SIGSEGV ==="
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-forensics
+          path: build-vv.log
+          if-no-files-found: warn
