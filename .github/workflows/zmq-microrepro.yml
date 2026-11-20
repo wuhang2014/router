@@ -1,10 +1,10 @@
 name: zmq-sigsegv-microrepro (issue 571)
 
-# Minimal C++ repro of the zmq::command_t / yqueue alignment fault:
-# gcc-15 on ubuntu-26.04 emits vmovdqa (aligned 256-bit stores) for the
-# 64-byte POD copy `_queue.back() = value_` even though command_t's
-# alignment is 8 in libzmq 4.3.4 (align attribute is MSVC-only there;
-# upstream master added __attribute__((aligned(64))) later).
+# v2: sweep POD copy sizes to find the size-class where gcc-15 (-march
+# default x86-64-v3, Ubuntu 26.04) lowers a 8-aligned struct copy to
+# ALIGNED vmovdqa stores -> fault on 16-aligned malloc memory.
+# Mirrors zmq::command_t (64B in libzmq 4.3.4, align 8 because
+# zeromq-src 0.2.6 drops HAVE_POSIX_MEMALIGN).
 
 on:
   workflow_dispatch:
@@ -19,75 +19,69 @@ permissions:
   contents: read
 
 jobs:
-  micro:
-    name: ${{ matrix.name }}
+  sweep:
+    name: sweep ${{ matrix.cxx }} ${{ matrix.flags }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: gcc15-default, cxx: g++, flags: "" }
-          - { name: gcc15-mnoavx, cxx: g++, flags: "-mno-avx" }
-          - { name: gcc15-march-v1, cxx: g++, flags: "-march=x86-64" }
-          - { name: gcc15-alignas64, cxx: g++, flags: "", align: 1 }
-          - { name: gcc15-O3, cxx: g++, flags: "-O3", loops: 200 }
-          - { name: gcc13-default, cxx: g++-13, flags: "" }
-    env:
-      ALIGN: ${{ matrix.align }}
+          - { cxx: g++, flags: "-O0" }
+          - { cxx: g++, flags: "-O3" }
+          - { cxx: g++, flags: "-O0 -mno-avx" }
+          - { cxx: g++-13, flags: "-O0" }
     steps:
       - name: Setup
         run: |
           sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends g++-13 binutils >/dev/null
           ${{ matrix.cxx }} --version | head -1
-          echo "--- default target ISA:"
-          ${{ matrix.cxx }} -Q --help=target 2>/dev/null | grep -E "^\s+-march=|^\s+-mtune=" || true
-          echo | ${{ matrix.cxx }} -dM -E - | grep -E "__AVX\b|__AVX2__|__SSE2__" | sort || true
-      - name: Build repro
+          echo | ${{ matrix.cxx }} -dM -E - ${{ matrix.flags }} | grep -cE "__AVX2__ 1" || true
+      - name: Sweep sizes
         run: |
-          cat > repro.cpp <<'EOF'
+          cat > gen.sh <<'SH'
+          #!/bin/bash
+          # $1 = total struct size, $2 = extra compile flags, $3 = optional decl
+          SZ=$1
+          cat > r.cpp <<EOF
           #include <cstdio>
           #include <new>
-          struct command_t {                 // libzmq 4.3.4 layout: align 8 on GCC
+          ${3}struct command_t {
               void *destination;
               int type;
               union args_t { void *p; unsigned long u; struct { int a, b; } h; } args;
-              char pad[64 - 8 - 8 - 16];
+              char pad[$((SZ - 40))];
           };
-          #ifdef USE_ALIGNAS
-          __attribute__((aligned(64)))
-          #endif
-          typedef command_t cmd_t;
-          struct chunk_t { cmd_t values[16]; chunk_t *prev; chunk_t *next; };
-          __attribute__((noinline)) void write_back (chunk_t *c_, unsigned pos_, const cmd_t &v_)
-          {
-              c_->values[pos_] = v_;         // ypipe_t<T,16>::write: _queue.back() = value_;
-          }
-          int main ()
-          {
-              printf ("sizeof=%zu alignof=%zu\n", sizeof (cmd_t), alignof (cmd_t));
-              cmd_t v {};
-              v.type = 3;
-              int faults = 0;
-              for (int round = 0; round < 32; round++) {
+          struct chunk_t { command_t values[16]; chunk_t *prev; chunk_t *next; };
+          __attribute__((noinline)) void write_back (chunk_t *c_, unsigned pos_, const command_t &v_)
+          { c_->values[pos_] = v_; }
+          int main () {
+              printf ("  sizeof=%zu alignof=%zu\n", sizeof (command_t), alignof (command_t));
+              command_t v {}; v.type = 3;
+              for (int round = 0; round < 64; round++) {
                   chunk_t *c = new (std::nothrow) chunk_t;
                   if (!c) break;
-                  unsigned pos = (unsigned) (round % 16);
-                  if (((unsigned long) &c->values[pos]) % 32 != 0)
-                      printf ("round=%d elem=%p NOT-32B-aligned\n", round, (void *) &c->values[pos]);
-                  write_back (c, pos, v);
+                  write_back (c, (unsigned) (round % 16), v);
               }
-              puts ("done-no-fault");
+              puts ("  run: done-no-fault");
               return 0;
           }
           EOF
-          EXTRA=""
-          [ "$ALIGN" = "1" ] && EXTRA="-DUSE_ALIGNAS"
-          ${{ matrix.cxx }} -O0 ${{ matrix.flags }} $EXTRA -g repro.cpp -o repro
-          echo "--- write_back disassembly (vector moves):"
-          objdump -d repro | awk '/<write_back/,/^$/' | grep -E "vmovdqa|vmovdqu|vmovaps|vmovups|movdqa|movdqu|movaps|movups|rep movs|vmovdqa64|ymm" | head -12 || echo "(none)"
-      - name: Run
+          $CXX $2 -g r.cpp -o r 2>err.txt || { echo "  compile: $(head -1 err.txt)"; exit 0; }
+          echo -n "  codegen: "
+          objdump -d r | grep -A40 "_Z11write_back" | grep -oE "vmovdqa[a-z0-9]*|vmovdqu[a-z0-9]*|movdqa|movdqu|rep movsq|movaps" | sort | uniq -c | tr '\n' ' '
+          echo
+          ./r; ec=$?
+          [ $ec -ne 139 ] || echo "  >>> SIGSEGV reproduced at size $SZ <<<"
+          SH
+          chmod +x gen.sh
+          export CXX=${{ matrix.cxx }}
+          for SZ in 40 48 56 64 72 80; do echo "== struct size $SZ:"; ./gen.sh $SZ "${{ matrix.flags }}" ""; done
+      - name: alignas(64) variant at 64
+        if: matrix.cxx == 'g++' && matrix.flags == '-O0'
         run: |
-          ulimit -c 0
-          ./repro; ec=$?
-          echo "exit=$ec"; [ $ec -ne 139 ] || echo "=== SIGSEGV (139) reproduced ==="
+          export CXX=g++
+          echo "== struct size 64 + alignas(64) on struct:"
+          ./gen.sh 64 "-O0" "__attribute__((aligned(64))) "
+          echo "== struct size 64 -march=x86-64 (v1):"
+          ./gen.sh 64 "-O0 -march=x86-64" ""
