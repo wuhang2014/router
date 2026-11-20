@@ -1,0 +1,55 @@
+name: zmq-release-codegen (issue 571)
+
+# Does the RELEASE profile (-O3, what cargo build --release gives cc) also
+# lower zmq::command_t copies to ALIGNED vmovdqa stores on ubuntu-26.04's
+# default gcc-15 (x86-64-v3)? Compiles the actual vendored mailbox.cpp
+# (instantiates ypipe_t<command_t,16>::write + mailbox_t::send) standalone
+# with the exact captured cc flags, at -O0 (control) and -O3 (release).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro/issue-571-zmq]
+
+concurrency:
+  group: zmq-rel-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  codegen:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Fetch deps (downloads zeromq-src vendor tree)
+        run: cargo fetch
+      - name: Compile vendored mailbox.cpp at -O0 and -O3
+        run: |
+          V=$(ls -d "$HOME"/.cargo/registry/src/*/zeromq-src-0.2.6+4.3.4/vendor)
+          echo "vendor: $V"
+          mkdir -p out && touch out/platform.hpp   # replicate zeromq-src's empty shim
+          g++ --version | head -1
+          for OPT in O0 O3; do
+            g++ -$OPT -ffunction-sections -fdata-sections -fPIC -m64 \
+              -I "$V/include" -I "$V/src" -I out -I "$V/external/sha1" \
+              -DZMQ_BUILD_TESTS=OFF -DZMQ_USE_CV_IMPL_STL11=1 -DZMQ_STATIC=1 \
+              -DZMQ_USE_BUILTIN_SHA1=1 -DZMQ_HAVE_WS=1 \
+              -DZMQ_IOTHREAD_POLLER_USE_EPOLL=1 -DZMQ_POLL_BASED_ON_POLL=1 \
+              -DZMQ_HAVE_IPC=1 -DHAVE_STRNLEN=1 -DZMQ_HAVE_UIO=1 -DZMQ_HAVE_STRLCPY=1 \
+              -c "$V/src/mailbox.cpp" -o mailbox-$OPT.o
+            echo "=== -$OPT mailbox.o vector stores:"
+            objdump -d --no-show-raw-insn mailbox-$OPT.o \
+              | grep -E "vmovdqa|vmovdqu|vmovaps|vmovups" | sort | uniq -c | sort -rn | head -6
+            echo "=== -$OPT ypipe_t<command_t>::write / mailbox_t::send disasm:"
+            objdump -d --no-show-raw-insn mailbox-$OPT.o | awk '/ypipe_t.*write|mailbox_t.*send/{f=1} f&&/vmov|call/{print} f&&/ret/{f=0}' | head -20
+          done
+      - name: Tiny runtime probe of the -O3 object's allocation+write shape
+        run: |
+          # Static proof complement: link mailbox-O3.o? Simpler ABI-level check:
+          # does ANY aligned-only ymm store exist in the -O3 object?
+          echo "aligned-only ymm stores in -O3 object:"
+          objdump -d --no-show-raw-insn mailbox-O3.o | grep -cE "vmovdqa.*%ymm|vmovdqa[0-9]*.*ymm" || echo 0
