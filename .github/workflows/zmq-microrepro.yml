@@ -1,0 +1,93 @@
+name: zmq-sigsegv-microrepro (issue 571)
+
+# Minimal C++ repro of the zmq::command_t / yqueue alignment fault:
+# gcc-15 on ubuntu-26.04 emits vmovdqa (aligned 256-bit stores) for the
+# 64-byte POD copy `_queue.back() = value_` even though command_t's
+# alignment is 8 in libzmq 4.3.4 (align attribute is MSVC-only there;
+# upstream master added __attribute__((aligned(64))) later).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro/issue-571-zmq]
+
+concurrency:
+  group: zmq-micro-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  micro:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: gcc15-default, cxx: g++, flags: "" }
+          - { name: gcc15-mnoavx, cxx: g++, flags: "-mno-avx" }
+          - { name: gcc15-march-v1, cxx: g++, flags: "-march=x86-64" }
+          - { name: gcc15-alignas64, cxx: g++, flags: "", align: 1 }
+          - { name: gcc15-O3, cxx: g++, flags: "-O3", loops: 200 }
+          - { name: gcc13-default, cxx: g++-13, flags: "" }
+    env:
+      ALIGN: ${{ matrix.align }}
+    steps:
+      - name: Setup
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends g++-13 binutils >/dev/null
+          ${{ matrix.cxx }} --version | head -1
+          echo "--- default target ISA:"
+          ${{ matrix.cxx }} -Q --help=target 2>/dev/null | grep -E "^\s+-march=|^\s+-mtune=" || true
+          echo | ${{ matrix.cxx }} -dM -E - | grep -E "__AVX\b|__AVX2__|__SSE2__" | sort || true
+      - name: Build repro
+        run: |
+          cat > repro.cpp <<'EOF'
+          #include <cstdio>
+          #include <new>
+          struct command_t {                 // libzmq 4.3.4 layout: align 8 on GCC
+              void *destination;
+              int type;
+              union args_t { void *p; unsigned long u; struct { int a, b; } h; } args;
+              char pad[64 - 8 - 8 - 16];
+          };
+          #ifdef USE_ALIGNAS
+          __attribute__((aligned(64)))
+          #endif
+          typedef command_t cmd_t;
+          struct chunk_t { cmd_t values[16]; chunk_t *prev; chunk_t *next; };
+          __attribute__((noinline)) void write_back (chunk_t *c_, unsigned pos_, const cmd_t &v_)
+          {
+              c_->values[pos_] = v_;         // ypipe_t<T,16>::write: _queue.back() = value_;
+          }
+          int main ()
+          {
+              printf ("sizeof=%zu alignof=%zu\n", sizeof (cmd_t), alignof (cmd_t));
+              cmd_t v {};
+              v.type = 3;
+              int faults = 0;
+              for (int round = 0; round < 32; round++) {
+                  chunk_t *c = new (std::nothrow) chunk_t;
+                  if (!c) break;
+                  unsigned pos = (unsigned) (round % 16);
+                  if (((unsigned long) &c->values[pos]) % 32 != 0)
+                      printf ("round=%d elem=%p NOT-32B-aligned\n", round, (void *) &c->values[pos]);
+                  write_back (c, pos, v);
+              }
+              puts ("done-no-fault");
+              return 0;
+          }
+          EOF
+          EXTRA=""
+          [ "$ALIGN" = "1" ] && EXTRA="-DUSE_ALIGNAS"
+          ${{ matrix.cxx }} -O0 ${{ matrix.flags }} $EXTRA -g repro.cpp -o repro
+          echo "--- write_back disassembly (vector moves):"
+          objdump -d repro | awk '/<write_back/,/^$/' | grep -E "vmovdqa|vmovdqu|vmovaps|vmovups|movdqa|movdqu|movaps|movups|rep movs|vmovdqa64|ymm" | head -12 || echo "(none)"
+      - name: Run
+        run: |
+          ulimit -c 0
+          ./repro; ec=$?
+          echo "exit=$ec"; [ $ec -ne 139 ] || echo "=== SIGSEGV (139) reproduced ==="
